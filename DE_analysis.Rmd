@@ -1,0 +1,298 @@
+**DE analysis against 2 controls**
+
+```{r}
+## LOAD LIBRARIES
+library(dplyr)
+library(tidyverse)
+library(DESeq2)
+library(UpSetR)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+```
+
+
+
+```{r}
+## DATA PROCESSING
+
+# read in data
+counts_matrix <- read.csv("~/Desktop/OVOL1_proj/hit-counts/raw_counts.csv")
+
+# remove Gene ID column
+counts_matrix$ID <- NULL
+
+# summing gene counts of duplicated gene name
+counts_matrix <- counts_matrix %>%
+  group_by(Gene.name) %>%
+  summarise(across(everything(), sum)) %>%
+  ungroup()
+
+# remove first row without genes
+counts_matrix <- counts_matrix[-1, ]
+
+# Set the unique gene names as row names
+counts_matrix <- counts_matrix %>%
+  column_to_rownames(var = "Gene.name") %>%
+  as.matrix()
+
+#renaming sample to maintain consistencies
+counts_matrix <- as.data.frame(counts_matrix) %>% rename(
+  K5.rtTA.1 = K5.1,
+  K5.rtTA.2 = K5.2,
+  K5.rtTA.3 = K5.3,
+  K5.OVOL1.1 = K5Ovol1.1,
+  K5.OVOL1.2 = K5Ovol1.2,
+  K5.OVOL1.3 = K5Ovol1.3,
+)
+
+
+# make metadata
+# Build manually matching your exact column order
+col_data <- data.frame(
+  row.names = c("K5.rtTA.3", "K5.rtTA.2", "K5.rtTA.1", 
+                "K5.OVOL1.3", "K5.OVOL1.2", "K5.OVOL1.1", 
+                "WT.3", "WT.2", "WT.1"),
+  Group = factor(c("K5.rtTA", "K5.rtTA", "K5.rtTA", 
+                   "K5.OVOL1", "K5.OVOL1", "K5.OVOL1", 
+                   "WT", "WT", "WT"))
+)
+
+# Set 'WT' as the reference baseline group
+col_data$Group <- relevel(col_data$Group, ref = "WT")
+
+
+# Ensure Group is a factor with WT as the reference level
+col_data$Group <- factor(col_data$Group, levels = c("WT", "K5.rtTA", "K5.OVOL1"))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_matrix,
+  colData = col_data,
+  design = ~ Group
+)
+
+# Filter low count genes across samples
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep, ]
+
+# Run main DESeq analysis
+dds <- DESeq(dds)
+
+```
+
+```{r}
+# ==============================================================================
+# Extract the 3 Specific Pairwise Contrasts
+# ==============================================================================
+# 1. K5Ovol1 vs K5 (Target vs Control 1)
+res_Ovol1_vs_K5 <- results(dds, contrast = c("Group", "K5.OVOL1", "K5.rtTA"))
+
+# 2. K5Ovol1 vs WT (Target vs Control 2)
+res_Ovol1_vs_WT <- results(dds, contrast = c("Group", "K5.OVOL1", "WT"))
+
+# 3. K5 vs WT (Control Baseline Check)
+res_K5_vs_WT    <- results(dds, contrast = c("Group", "K5.rtTA", "WT"))
+
+# Convert results to tidy data frames
+df_Ovol1_vs_K5 <- as.data.frame(res_Ovol1_vs_K5) %>% rownames_to_column("Gene")
+df_Ovol1_vs_WT <- as.data.frame(res_Ovol1_vs_WT) %>% rownames_to_column("Gene")
+df_K5_vs_WT    <- as.data.frame(res_K5_vs_WT)    %>% rownames_to_column("Gene")
+```
+
+```{r}
+# ==============================================================================
+# Intersection Filtering Logic
+# ==============================================================================
+# Set statistical significance thresholds
+padj_cutoff <- 0.05
+lfc_cutoff  <- 1
+
+# 1. Genes DE in K5Ovol1 vs K5
+de_Ovol1_vs_K5 <- df_Ovol1_vs_K5 %>%
+  filter(!is.na(padj) & padj < padj_cutoff & abs(log2FoldChange) >= lfc_cutoff) %>%
+  pull(Gene)
+
+# 2. Genes DE in K5Ovol1 vs WT
+de_Ovol1_vs_WT <- df_Ovol1_vs_WT %>%
+  filter(!is.na(padj) & padj < padj_cutoff & abs(log2FoldChange) >= lfc_cutoff) %>%
+  pull(Gene)
+
+
+# 3. Genes NOT DE in K5 vs WT (Control Baseline Check)
+# We consider a gene "Not DE" if its adjusted p-value is >= 0.05 (or NA) or have lfc < 1
+not_de_K5_vs_WT <- df_K5_vs_WT %>%
+  filter(is.na(padj) | padj >= padj_cutoff | abs(log2FoldChange) < lfc_cutoff) %>%
+  pull(Gene)
+
+de_K5_vs_WT <- df_K5_vs_WT %>%
+  filter(!is.na(padj) & padj < padj_cutoff & abs(log2FoldChange) >= lfc_cutoff) %>%
+  pull(Gene)
+```
+
+```{r}
+# ==============================================================================
+# Final Intersection & Output Table
+# ==============================================================================
+# Find genes present in BOTH target contrasts AND absent/unchanged in control baseline
+target_degs <- intersect(intersect(de_Ovol1_vs_K5, de_Ovol1_vs_WT), not_de_K5_vs_WT)
+
+cat("Number of true Ovol1-induced DEGs:", length(target_degs), "\n")
+
+# Combine detailed stats for these specific genes into a single master summary table
+final_deg_table <- df_Ovol1_vs_K5 %>%
+  filter(Gene %in% target_degs) %>%
+  dplyr::select(Gene, log2FC_vs_K5 = log2FoldChange, padj_vs_K5 = padj) %>%
+  inner_join(
+    df_Ovol1_vs_WT %>% dplyr::select(Gene, log2FC_vs_WT = log2FoldChange, padj_vs_WT = padj),
+    by = "Gene"
+  ) %>%
+  inner_join(
+    df_K5_vs_WT %>% dplyr::select(Gene, log2FC_K5_vs_WT = log2FoldChange, padj_K5_vs_WT = padj),
+    by = "Gene"
+  ) %>%
+  arrange(padj_vs_K5)
+
+# Save to CSV
+write.csv(final_deg_table, "~/Desktop/OVOL1_proj/Ovol1_Specific_DEGs_TwoControl_Filtered.csv", row.names = FALSE)
+```
+
+```{r}
+listInput <- list(K5.rtTA_vs_WT = de_K5_vs_WT, 
+                  K5.OVOL1_vs_K5.rtTA = de_Ovol1_vs_K5, 
+                  K5.OVOL1_vs_WT = de_Ovol1_vs_WT)
+  
+upset(fromList(listInput), order.by = "freq")
+```
+Cluster Profiler Pathway enrichment
+```{r}
+# Convert gene symbols to Entrez IDs
+gene_ids <- bitr(
+  final_deg_table$Gene, 
+  fromType = "SYMBOL", 
+  toType   = "ENTREZID", 
+  OrgDb    = org.Mm.eg.db
+)
+
+# Vector of Entrez IDs
+entrez_vec <- gene_ids$ENTREZID
+
+# Run GO Enrichment for Biological Processes (BP)
+ego_bp <- enrichGO(
+  gene          = entrez_vec,
+  OrgDb         = org.Mm.eg.db,
+  ont           = "BP",                # "BP" for Biological Process
+  pAdjustMethod = "BH",                # Benjamini-Hochberg adjustment
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.10,
+  readable      = TRUE                 # Converts Entrez IDs back to Gene Symbols in results
+)
+
+# View top enriched terms
+head(ego_bp)
+
+p_dot <- dotplot(ego_bp, showCategory = 15, title = "GO Biological Processes")
+print(p_dot)
+
+# Run KEGG Enrichment (mmu = Mus musculus)
+kegg_res <- enrichKEGG(
+  gene         = entrez_vec,
+  organism     = "mmu",
+  pvalueCutoff = 0.05
+)
+
+# Convert Entrez IDs back to symbols in the KEGG object for readability
+kegg_res <- setReadable(kegg_res, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+
+# View top KEGG pathways
+head(kegg_res)
+
+p_dot <- dotplot(kegg_res, showCategory = 15, title = "KEGG")
+print(p_dot)
+```
+
+
+GO enrichment volcano plot & heat map (df_Ovol1_vs_K5)
+```{r}
+# 1. Prepare your input dataset
+# Assume 'df_Ovol1_vs_K5' contains all genes with 'log2FoldChange' and 'padj'
+# Assume 'pathway_genes' is a vector of gene symbols mapped to your GO/KEGG terms of interest 
+# Example: pathway_genes <- c("Krt7", "Krt16", "Krt75", "Krt78", "Krt80", "Klf4", "Alox12b", "Aloxe3", "Pkp3", "Itga3", "Ovol1")
+ego_bp <- as.data.frame(ego_bp)
+
+pathway_gene_table <- ego_bp %>%
+  dplyr::select(ID, Description, p.adjust, geneID) %>%
+  separate_rows(geneID, sep = "/") %>%
+  rename(Gene = geneID, Pathway = Description)
+```
+
+
+```{r}
+target_pathway <- c("wound healing")
+
+pathway_genes <- as.data.frame(ego_bp) %>%
+  filter(Description == target_pathway, ignore.case = TRUE) %>%
+  separate_rows(geneID, sep = "/") %>%
+  pull(geneID) %>%
+  unique()
+
+plot_df <- df_Ovol1_vs_WT %>%
+  mutate(
+    # Set significance status
+    Significance = case_when(
+      Gene %in% pathway_genes ~ "Pathway Gene",
+      padj < 0.05 & log2FoldChange >= 0.585 ~ "Up-regulated",
+      padj < 0.05 & log2FoldChange <= -0.585 ~ "Down-regulated",
+      TRUE ~ "Not Significant"
+    ),
+    # Create -log10 p-adj column (cap extreme values for better plotting)
+    negLogP = -log10(pmax(padj, 1e-50))
+  )
+
+# 2. Build Volcano Plot
+volcano_plot <- ggplot(plot_df, aes(x = log2FoldChange, y = negLogP)) +
+  # Background non-pathway points
+  geom_point(data = filter(plot_df, Significance != "Pathway Gene"),
+             aes(color = Significance), alpha = 0.4, size = 1.5) +
+  # Highlight Pathway Genes on top
+  geom_point(data = filter(plot_df, Significance == "Pathway Gene"),
+             color = "#E41A1C", size = 3, alpha = 0.9) +
+  # Add text labels for pathway genes
+  geom_text_repel(
+    data = filter(plot_df, Significance == "Pathway Gene"),
+    aes(label = Gene),
+    size = 3.5,
+    fontface = "bold",
+    box.padding = 0.4,
+    point.padding = 0.3,
+    max.overlaps = 30
+  ) +
+  # Cutoff lines
+  geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed", color = "gray40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray40") +
+  # Color palette
+  scale_color_manual(values = c(
+    "Down-regulated" = "#377EB8",
+    "Up-regulated"   = "#4DAF4A",
+    "Not Significant"= "gray70"
+  )) +
+  labs(
+    title = "Volcano Plot: Ovol1-Induced Response",
+    subtitle = "Highlighted genes belong to key enriched pathway - Wound Healing",
+    x = expression(log[2] ~ "Fold Change (K5.OVOL1 vs WT)"),
+    y = expression(-log[10] ~ "(" * italic(p)[adj] * ")"),
+    color = "Status"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 15),
+    legend.position = "right"
+  )
+
+print(volcano_plot)
+```
+
+
