@@ -1,0 +1,117 @@
+---
+title: "GSE32628"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+
+# 1. Download
+gse <- getGEO("GSE32628", destdir = ".", getGPL = TRUE)[[1]]
+exprs_mat <- exprs(gse)
+metadata <- pData(gse)
+
+# 2. Clean Metadata
+# GSE32628 usually has "normal", "actinic keratosis", and "squamous cell carcinoma" 
+# in the 'title' or 'description' columns.
+metadata <- metadata %>%
+  mutate(Condition = case_when(
+    grepl("normal skin", source_name_ch1, ignore.case = TRUE) ~ "NS",
+    grepl("actinic keratosis", source_name_ch1, ignore.case = TRUE) ~ "AK",
+    grepl("cutaneous squamous cell carcinoma", source_name_ch1, ignore.case = TRUE) ~ "cSCC",
+    TRUE ~ "Other"
+  )) %>%
+  mutate(Condition = factor(Condition, levels = c("NS", "AK", "cSCC")))
+
+# 3. Map Probe IDs to Gene Symbols (GPL570)
+feature_data <- fData(gse)
+# Standard column for Gene Symbols in GPL570 is usually 'Gene Symbol' or 'SYMBOL'
+symbol_col <- grep("SYMBOL|Gene.Symbol", colnames(feature_data), ignore.case = TRUE, value = TRUE)[1]
+
+probe_mapping <- feature_data %>%
+  select(ID, Symbol = !!sym(symbol_col)) %>%
+  filter(Symbol != "" & !is.na(Symbol)) %>%
+  mutate(Symbol = gsub(" ///.*", "", Symbol)) # Keep first symbol if multiple
+
+# Filter for your specific markers
+target_genes <- c("TWIST1", "OVOL1", "KLF4", "IVL", "LOR", "KRT1", "KRT10", "MYC")
+selected_probes <- probe_mapping %>% filter(Symbol %in% target_genes)
+
+# 4. Extract and Average Probes
+clean_exprs <- exprs_mat[as.character(selected_probes$ID), ]
+rownames(clean_exprs) <- selected_probes$Symbol
+clean_exprs_unique <- avereps(clean_exprs, ID = rownames(clean_exprs))
+```
+```{r}
+# Prepare plotting data
+plot_df <- as.data.frame(t(clean_exprs_unique))
+plot_df$Condition <- metadata$Condition
+
+# Faceted Scatter Plot
+ggplot(plot_df, aes(x = TWIST1, y = OVOL1)) +
+  geom_point(aes(color = Condition), size = 3.5, alpha = 0.8) +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed", se = TRUE) +
+  stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") + 
+  facet_wrap(~Condition, scales = "free") + 
+  theme_bw() +
+  scale_color_manual(values = c("NS" = "#2c7bb6", "AK" = "#fdae61", "cSCC" = "#d7191c")) +
+  labs(
+    title = "GSE32628: TWIST1 vs OVOL1 Correlation by Stage",
+    subtitle = "Spearman Rho across cSCC progression",
+    x = "TWIST1 (log2 Intensity)",
+    y = "OVOL1 (log2 Intensity)"
+  )
+```
+```{r}
+# Calculate Spearman Correlation
+cor_mat <- cor(t(clean_exprs_unique), method = "spearman")
+
+library(pheatmap)
+pheatmap(cor_mat[c("TWIST1", "OVOL1"), ], 
+         display_numbers = TRUE,
+         main = "Correlation: TWIST1/OVOL1 vs. Proliferation & Differentiation Markers",
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100))
+```
+
+```{r}
+# Reshape for boxplot
+long_df <- plot_df %>%
+  pivot_longer(cols = -Condition, names_to = "Gene", values_to = "Expression") %>%
+  filter(Gene %in% c("TWIST1", "OVOL1"))
+
+# Use your existing long_df
+ggplot(long_df, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  # Adding jittered points helps show the actual sample size per group
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1) + 
+  facet_wrap(~Gene, scales = "free_y") +
+  theme_bw() +
+  # 1. Change to ANOVA for a global p-value across all 3 groups
+  stat_compare_means(method = "anova", label.y.npc = "top", label.x.npc = 0.1) +
+  # 2. Add pairwise comparisons to see exactly WHERE the shift happens
+  # (e.g., NS vs AK, AK vs cSCC)
+  stat_compare_means(comparisons = list(c("NS", "AK"), c("AK", "cSCC"), c("NS", "cSCC")),
+                     label = "p.signif", 
+                     method = "t.test",
+                     step.increase = 0.1) +
+  scale_fill_manual(values = c("NS" = "#66c2a5", "AK" = "#fc8d62", "cSCC" = "#8da0cb")) +
+  labs(
+    title = "Gene Expression Shift Across cSCC Progression",
+    subtitle = "Global ANOVA with Pairwise T-tests",
+    x = "Condition",
+    y = "Expression (log2 Intensity)"
+  ) +
+  theme(
+    strip.background = element_rect(fill = "gray95"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+The asterisk at the very top indicates a significant difference between conditions.

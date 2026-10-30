@@ -1,0 +1,67 @@
+---
+title: "Correlation Analysis: TWIST1 vs OVOL1 in GSE294844"
+output: html_document
+---
+
+```{r}
+library(GEOquery)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(limma)
+
+# 1. Load Data
+gse <- getGEO("GSE294844", destdir = ".", getGPL = TRUE)[[1]]
+exprs_mat <- exprs(gse)
+metadata <- pData(gse)
+
+# 2. Extract Normal vs Dysplastic from the Title
+# We look for "normal" or "NS" vs "dysplastic" or "AK" in the title string
+metadata <- metadata %>%
+  mutate(Condition = case_when(
+    grepl("normal|NS", title, ignore.case = TRUE) ~ "NS",
+    grepl("dysplastic|AK|lesion", title, ignore.case = TRUE) ~ "AK",
+    TRUE ~ "Other"
+  )) %>%
+  mutate(Condition = factor(Condition, levels = c("NS", "AK")))
+
+# Re-download with a focus on the platform (GPL)
+gse <- getGEO("GSE294844", destdir = ".", getGPL = TRUE, AnnotGPL = TRUE)[[1]]
+feature_data <- fData(gse)
+colnames(feature_data) # Check again
+
+# 1. Get the feature data
+feature_data <- fData(gse)
+
+# 2. Find the column that looks like it contains Gene Symbols
+# We'll look for "SYMBOL", "Gene Symbol", or "Gene.Symbol"
+potential_cols <- grep("SYMBOL|Gene.Symbol|Gene Symbol", colnames(feature_data), ignore.case = TRUE, value = TRUE)
+
+if(length(potential_cols) == 0) {
+  stop("Could not find a Symbol column. Check colnames(fData(gse)) manually.")
+}
+
+# Pick the first match
+target_col <- potential_cols[1]
+message("Using column: ", target_col, " for Gene Symbols")
+
+# 3. Perform the mapping using standard base-R indexing for the rename
+probe_mapping <- feature_data %>%
+  # We use .data[[target_col]] to safely handle the dynamic string
+  mutate(Symbol = .data[[target_col]]) %>%
+  select(ID, Symbol) %>%
+  filter(!is.na(Symbol) & Symbol != "") %>%
+  # Clean up Affymetrix multi-gene strings
+  mutate(Symbol = gsub(" ///.*", "", Symbol))
+
+# 4. Proceed with filtering your markers
+target_genes <- c("TWIST1", "OVOL1", "KLF4", "IVL", "LOR", "KRT1", "KRT10", "MYC")
+selected_probes <- probe_mapping %>% filter(Symbol %in% target_genes)
+
+# Now extract and average
+clean_exprs <- exprs_mat[as.character(selected_probes$ID), ]
+rownames(clean_exprs) <- selected_probes$Symbol
+clean_exprs_unique <- avereps(clean_exprs, ID = rownames(clean_exprs))
+```
+
+

@@ -1,0 +1,149 @@
+---
+title: "test"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+# Install if needed
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+
+# Load
+library(GEOquery)
+library(limma)
+library(Biobase)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+```{r}
+gse <- getGEO("GSE45164", destdir = ".", getGPL = TRUE)
+if (length(gse) > 1) idx <- grep("GPL571", attr(gse, "names")) else idx <- 1
+gse <- gse[[idx]]
+
+# 2. Extract Expression Matrix (already log2 transformed usually) and Metadata
+exprs_mat <- exprs(gse)
+metadata <- pData(gse)
+
+```
+```{r}
+metadata <- metadata %>%
+  select(title, characteristics_ch1) %>%
+  mutate(Condition = ifelse(grepl("SCC", title), "cSCC", "Normal"))
+```
+
+```{r}
+# 4. Map Probes to Symbols
+feature_data <- fData(gse) # Contains Probe to Symbol mapping
+probe_mapping <- feature_data %>%
+  select(ID, Symbol = `Gene Symbol`) %>%
+  filter(Symbol != "")
+
+# See the column names
+colnames(fData(gse))
+
+# Look at the first few rows to spot the symbols
+head(fData(gse))
+
+# Extract specific genes of interest
+target_genes <- c("TWIST1", "OVOL1", "KLF4", "IVL", "LOR", "KRT1", "KRT10", "MYC", "MAPKAPK2")
+selected_probes <- probe_mapping %>%
+  filter(Symbol %in% target_genes)
+
+# Create a clean expression matrix with Gene Symbols
+clean_exprs <- exprs_mat[selected_probes$ID, ]
+rownames(clean_exprs) <- selected_probes$Symbol
+```
+
+```{r}
+# Prepare plotting data
+plot_df <- as.data.frame(t(clean_exprs))
+plot_df$Condition <- metadata$Condition
+
+library(ggpubr)
+clean_exprs_unique <- avereps(clean_exprs, ID = rownames(clean_exprs))
+
+# 2. Re-create the plotting data frame
+plot_df <- as.data.frame(t(clean_exprs_unique))
+
+# 3. Re-attach the Condition metadata
+# Ensure the order matches (it should, as we only transposed the rows)
+plot_df$Condition <- metadata$Condition
+
+# 4. Now the Scatter Plot will work because 'TWIST1' is a unique column name
+ggplot(plot_df, aes(x = TWIST1, y = OVOL1)) +
+  geom_point(aes(color = Condition), size = 4) +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed") +
+  stat_cor(method = "spearman") + 
+  theme_minimal() +
+  labs(
+    title = "GSE45164: TWIST1 vs OVOL1 Inverse Correlation",
+    subtitle = "Averaged probes per gene symbol",
+    x = "TWIST1 Expression (log2 Intensity)",
+    y = "OVOL1 Expression (log2 Intensity)"
+  )
+```
+FACET BY CONDITION
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(limma)
+
+# 1. Consolidate duplicate probes (important for Affymetrix GPL571)
+clean_exprs_unique <- avereps(clean_exprs, ID = rownames(clean_exprs))
+
+# 2. Re-create the plotting data frame
+plot_df <- as.data.frame(t(clean_exprs_unique))
+
+# 3. Re-attach the Condition metadata from your object
+plot_df$Condition <- metadata$Condition
+
+# 4. Generate the Faceted Scatter Plot
+ggplot(plot_df, aes(x = TWIST1, y = OVOL1)) +
+  geom_point(aes(color = Condition), size = 4, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed", se = TRUE) +
+  # This will now calculate a separate Rho and p-value for each facet
+  stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") + 
+  # THE KEY ADDITION:
+  facet_wrap(~Condition, scales = "free") + 
+  theme_bw() + # theme_bw often looks cleaner with facets
+  labs(
+    title = "GSE45164: TWIST1 vs OVOL1 Expression by Group",
+    subtitle = "Averaged probes; Faceted by Condition",
+    x = "TWIST1 Expression (log2 Intensity)",
+    y = "OVOL1 Expression (log2 Intensity)"
+  ) +
+  theme(legend.position = "none") # Legend is redundant when faceted
+```
+
+
+
+```{r}
+# Calculate Spearman Correlation Matrix
+cor_mat <- cor(t(clean_exprs), method = "spearman")
+
+# Plot Heatmap
+library(pheatmap)
+pheatmap(cor_mat[c("TWIST1", "OVOL1"), ], 
+         display_numbers = TRUE,
+         main = "Correlation: TWIST1/OVOL1 vs. Markers (GSE45164)",
+         color = colorRampPalette(c("darkblue", "white", "darkred"))(100))
+```
+```{r}
+# Reshape for boxplot
+long_df <- plot_df %>%
+  pivot_longer(cols = -Condition, names_to = "Gene", values_to = "Expression") %>%
+  filter(Gene %in% c("TWIST1", "OVOL1"))
+
+ggplot(long_df, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot() +
+  facet_wrap(~Gene, scales = "free_y") +
+  theme_bw() +
+  stat_compare_means(method = "t.test") +
+  labs(title = "Shift in Expression: Normal vs. cSCC")
+```
+

@@ -1,0 +1,399 @@
+---
+title: "Combined Dataset"
+output:
+  pdf_document: default
+  html_document: default
+---
+**TEST FOR COMBINATIONS OF DATA**
+```{r}
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(sva)
+library(tidyr)
+
+# 1. Define your Master List
+gse_ids <- c("GSE32628", "GSE45164", "GSE45216", "GSE98767")
+target_genes <- c("TWIST1", "OVOL1")
+
+# ----------------------------------------------------------------
+# STEP 1: PRE-DOWNLOAD & PRE-PROCESS INDIVIDUALS
+# ----------------------------------------------------------------
+# Store processed data in a list to avoid re-downloading in loops
+processed_data <- lapply(gse_ids, function(id) {
+  message("Pre-processing: ", id)
+  gse <- getGEO(id, destdir = ".", getGPL = TRUE)[[1]]
+  exprs_mat <- exprs(gse)
+  meta <- pData(gse)
+  
+  if (max(exprs_mat, na.rm=T) > 50) exprs_mat <- log2(exprs_mat + 1)
+  
+  # Standardize Metadata
+  meta <- meta %>%
+    mutate(Condition = case_when(
+      grepl("normal|control", paste(title, source_name_ch1), ignore.case = TRUE) ~ "NS",
+      grepl("keratosis|AK", paste(title, source_name_ch1), ignore.case = TRUE) ~ "AK",
+      grepl("carcinoma|SCC", paste(title, source_name_ch1), ignore.case = TRUE) ~ "cSCC",
+      TRUE ~ "Other"
+    )) %>%
+    filter(Condition != "Other") %>%
+    mutate(Batch = id, SampleID = rownames(.))
+  
+  # Map Genes
+  fdata <- fData(gse)
+  sym_col <- grep("SYMBOL|Gene.Symbol", colnames(fdata), ignore.case = TRUE, value = TRUE)[1]
+  mapping <- fdata %>% select(ID, Symbol = !!sym_col) %>% 
+    mutate(Symbol = gsub(" ///.*", "", Symbol)) %>% filter(Symbol %in% target_genes)
+  
+  sub_ex <- exprs_mat[as.character(mapping$ID), colnames(exprs_mat) %in% rownames(meta), drop=FALSE]
+  rownames(sub_ex) <- mapping$Symbol
+  return(list(exprs = avereps(sub_ex), meta = meta))
+})
+names(processed_data) <- gse_ids
+
+# ----------------------------------------------------------------
+# STEP 2: ROBUST COMBINATORIAL LOOP
+# ----------------------------------------------------------------
+results_list <- list()
+
+for (i in 1:length(gse_ids)) {
+  combos <- combn(gse_ids, i, simplify = FALSE)
+  
+  for (subset_ids in combos) {
+    combo_name <- paste(subset_ids, collapse = " + ")
+    message("Testing Combination: ", combo_name)
+    
+    current_list <- processed_data[subset_ids]
+    common_genes <- Reduce(intersect, lapply(current_list, function(x) rownames(x$exprs)))
+    
+    if(!all(c("TWIST1", "OVOL1") %in% common_genes)) next
+    
+    merged_exprs <- do.call(cbind, lapply(current_list, function(x) x$exprs[common_genes, ]))
+    merged_meta <- do.call(rbind, lapply(current_list, function(x) x$meta %>% select(Condition, Batch)))
+    
+    # --- BATCH CORRECTION WITH SINGULARITY CHECK ---
+    final_exprs <- merged_exprs
+    if (length(subset_ids) > 1) {
+      merged_meta$Condition <- as.factor(merged_meta$Condition)
+      merged_meta$Batch <- as.factor(merged_meta$Batch)
+      
+      # Check if 'Condition' has more than 1 level and isn't confounded with 'Batch'
+      # If a condition only exists in one batch, we can't use it in the model
+      condition_counts <- table(merged_meta$Condition, merged_meta$Batch)
+      is_singular <- any(rowSums(condition_counts > 0) < 2) 
+      
+      tryCatch({
+        if (is_singular) {
+          message("  ! Confounding detected. Running ComBat without Condition adjustment.")
+          # Use an intercept-only model if groups don't overlap across batches
+          mod_null <- model.matrix(~1, data = merged_meta)
+          final_exprs <- ComBat(dat = merged_exprs, batch = merged_meta$Batch, mod = mod_null)
+        } else {
+          mod <- model.matrix(~Condition, data = merged_meta)
+          final_exprs <- ComBat(dat = merged_exprs, batch = merged_meta$Batch, mod = mod)
+        }
+      }, error = function(e) {
+        message("  ! ComBat failed for ", combo_name, ". Using uncorrected data.")
+        final_exprs <<- merged_exprs
+      })
+    }
+    
+    # --- STATISTICS ---
+    cor_res <- tryCatch({
+      ct <- cor.test(final_exprs["TWIST1",], final_exprs["OVOL1",], method = "pearson")
+      list(r = ct$estimate, p = ct$p.value)
+    }, error = function(e) list(r = NA, p = NA))
+    
+    results_list[[combo_name]] <- data.frame(
+      Combination = combo_name,
+      Num_Datasets = length(subset_ids),
+      Total_Samples = ncol(final_exprs),
+      Pearson_R = cor_res$r,
+      P_Value = cor_res$p,
+      Significant = ifelse(!is.na(cor_res$p) && cor_res$p < 0.05, "YES", "NO")
+    )
+  }
+}
+
+final_results_table <- do.call(rbind, results_list) %>% arrange(P_Value)
+print(final_results_table)
+```
+
+```{r}
+# 1. Load Libraries
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(sva)       # For Batch Correction (ComBat)
+library(ggplot2)
+library(ggpubr)
+
+# ----------------------------------------------------------------              
+# STEP 1: DEFINE DATASETS AND SETTINGS
+# ----------------------------------------------------------------
+gse_ids <- c("GSE32628", "GSE45164", "GSE45216")
+target_genes <- c("TWIST1", "OVOL1", "KLF4", "IVL", "KRT10", "MYC")
+
+# ----------------------------------------------------------------
+# STEP 2: DOWNLOAD AND HARMONIZE METADATA
+# ----------------------------------------------------------------
+# We create a function to process each GSE so the logic is identical
+process_gse <- function(id) {
+  gse <- getGEO(id, destdir = ".", getGPL = TRUE)[[1]]
+  exprs_mat <- exprs(gse)
+  meta <- pData(gse)
+  
+  # Log transform if needed
+  if (max(exprs_mat, na.rm=T) > 50) exprs_mat <- log2(exprs_mat + 1)
+  
+  # HARMONIZE CONDITION NAMES
+  # This is the most important part: ensure "Normal" is same across studies
+  meta <- meta %>%
+    mutate(Condition = case_when(
+      grepl("normal", paste(title, source_name_ch1), ignore.case = TRUE) ~ "NS",
+      grepl("keratosis|AK", paste(title, source_name_ch1), ignore.case = TRUE) ~ "AK",
+      grepl("carcinoma|SCC", paste(title, source_name_ch1), ignore.case = TRUE) ~ "cSCC",
+      TRUE ~ "Other"
+    )) %>%
+    filter(Condition != "Other") %>%
+    mutate(Batch = id) # Track which study the sample came from
+  
+  # PROBE MAPPING
+  fdata <- fData(gse)
+  sym_col <- grep("SYMBOL|Gene.Symbol", colnames(fdata), ignore.case = TRUE, value = TRUE)[1]
+  
+  mapping <- fdata %>%
+    select(ID, Symbol = !!sym_col) %>%
+    mutate(Symbol = gsub(" ///.*", "", Symbol)) %>%
+    filter(Symbol %in% target_genes)
+  
+  # Subset and Average
+  sub_exprs <- exprs_mat[as.character(mapping$ID), colnames(exprs_mat) %in% rownames(meta)]
+  rownames(sub_exprs) <- mapping$Symbol
+  clean_sub <- avereps(sub_exprs)
+  
+  return(list(exprs = clean_sub, meta = meta))
+}
+
+# Run the function for all IDs
+data_list <- lapply(gse_ids, process_gse)
+```
+
+*CHECK FOR BATCH EFFECTS (BEFORE)*
+```{r}
+# MERGE RAW DATA FIRST ---
+# Find common genes across all processed datasets
+common_genes <- Reduce(intersect, lapply(data_list, function(x) rownames(x$exprs)))
+
+# Combine raw expression matrices
+merged_exprs <- do.call(cbind, lapply(data_list, function(x) x$exprs[common_genes, ]))
+
+# Combine metadata
+combined_meta <- do.call(rbind, lapply(data_list, function(x) {
+  x$meta %>% select(Condition, Batch)
+}))
+
+# ----------------------------------------------------------------
+# CHECK FOR BATCH EFFECTS (BEFORE CORRECTION)
+# ----------------------------------------------------------------
+# PCA on RAW merged data
+pca_raw <- prcomp(t(merged_exprs), scale. = TRUE)
+df_raw <- as.data.frame(pca_raw$x)
+df_raw$Batch <- combined_meta$Batch
+df_raw$Condition <- combined_meta$Condition
+
+# Plotting Before
+ggplot(df_raw, aes(x = PC1, y = PC2, color = Batch, shape = Condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = Batch), linetype = 2) + 
+  theme_minimal() +
+  labs(title = "PCA: Before Batch Correction", 
+       subtitle = "If clusters follow 'Batch' colors, a technical bias is present")
+```
+
+```{r}
+# ----------------------------------------------------------------
+# STEP 3: MERGE AND BATCH CORRECT
+# ----------------------------------------------------------------
+# Find common genes across all datasets
+common_genes <- Reduce(intersect, lapply(data_list, function(x) rownames(x$exprs)))
+
+# Combine expression matrices
+combined_exprs <- do.call(cbind, lapply(data_list, function(x) x$exprs[common_genes, ]))
+
+# Combine metadata
+combined_meta <- do.call(rbind, lapply(data_list, function(x) x$meta %>% select(Condition, Batch)))
+
+# RUN COMBAT: This removes the "Study Effect" while keeping the "Disease Effect"
+mod <- model.matrix(~as.factor(Condition), data = combined_meta)
+batch_corrected <- ComBat(dat = combined_exprs, batch = combined_meta$Batch, mod = mod)
+```
+*CHECK FOR BATCH EFFECTS*
+```{r}
+##VISUALIZING OUTLIERS
+# Calculate PCA
+pca_res <- prcomp(t(batch_corrected), scale. = TRUE)
+pca_df <- as.data.frame(pca_res$x)
+pca_df$Condition <- combined_meta$Condition
+pca_df$Batch <- combined_meta$Batch
+pca_df$SampleID <- rownames(pca_df)
+
+# Plot PCA to spot outliers visually
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Batch, shape = Condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(linetype = 2) + # Ellipses help identify points outside the 95% confidence interval
+  theme_minimal() +
+  labs(title = "PCA of Combined Dataset", subtitle = "Spotting multivariate outliers")
+
+# Function to find outliers based on IQR for a specific gene
+get_outliers <- function(data, gene_name) {
+  vals <- data[gene_name, ]
+  q1 <- quantile(vals, 0.25)
+  q3 <- quantile(vals, 0.75)
+  iqr <- q3 - q1
+  # We use a strict 3x IQR for "extreme" outliers to avoid losing too much data
+  lower_bound <- q1 - 3 * iqr
+  upper_bound <- q3 + 3 * iqr
+  
+  outlier_samples <- names(vals[vals < lower_bound | vals > upper_bound])
+  return(outlier_samples)
+}
+
+# Identify outliers for our two main genes
+twist_outliers <- get_outliers(batch_corrected, "TWIST1")
+ovol_outliers <- get_outliers(batch_corrected, "OVOL1")
+
+all_outliers <- unique(c(twist_outliers, ovol_outliers))
+
+message("Removing ", length(all_outliers), " extreme outliers: ", paste(all_outliers, collapse=", "))
+
+# 3. Create the "Cleaned" Final Objects
+final_exprs <- batch_corrected[, !colnames(batch_corrected) %in% all_outliers]
+final_meta <- combined_meta[!rownames(combined_meta) %in% all_outliers, ]
+```
+
+
+```{r}
+# ----------------------------------------------------------------
+# STEP 4: FINAL PLOTTING WITH NON-PARAMETRIC TESTS & FDR
+# ----------------------------------------------------------------
+# Use final_exprs (outlier removed) and final_meta for the cleanest stats
+plot_df <- as.data.frame(t(final_exprs))
+plot_df$Condition <- factor(final_meta$Condition, levels = c("NS", "AK", "cSCC"))
+
+# Prepare long format
+long_df <- plot_df %>%
+  pivot_longer(cols = any_of(c("TWIST1", "OVOL1")), 
+               names_to = "Gene", 
+               values_to = "Expression")
+
+# Define the pairwise comparisons you actually care about
+my_comparisons <- list( c("NS", "AK"), c("AK", "cSCC"), c("NS", "cSCC") )
+
+# Boxplot with Kruskal-Wallis + Pairwise Wilcoxon (FDR Adjusted)
+ggplot(long_df, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 1) +
+  facet_wrap(~Gene, scales = "free_y") +
+  # 1. Global test (Kruskal-Wallis is better for non-normal gene data)
+  stat_compare_means(method = "kruskal.test", label.y.npc = "top") + 
+  # 2. Pairwise tests with FDR (BH) adjustment
+  stat_compare_means(comparisons = my_comparisons, 
+                     method = "wilcox.test", 
+                     p.adjust.method = "BH", # False Discovery Rate correction
+                     label = "p.signif") +
+  theme_minimal() +
+  scale_fill_manual(values = c("NS" = "#66c2a5", "AK" = "#fc8d62", "cSCC" = "#8da0cb")) +
+  labs(title = "Gene Expression Progression in cSCC",
+       subtitle = "Pairwise Wilcoxon tests with Benjamini-Hochberg (FDR) correction",
+       y = "Batch-Corrected Log2 Expression")
+
+# --- Faceted Correlation Plot ---
+ggplot(plot_df, aes(x = TWIST1, y = OVOL1)) +
+  geom_point(aes(color = Condition), size = 3, alpha = 0.6) +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed", se = TRUE) +
+  # Spearman is non-parametric and often more significant for these "switches"
+  stat_cor(method = "spearman", 
+           label.x.npc = "left", 
+           label.y.npc = "top",
+           color = "blue",
+           size = 4) +
+  facet_wrap(~Condition, scales = "free") + 
+  theme_bw() +
+  scale_color_manual(values = c("NS" = "#66c2a5", "AK" = "#fc8d62", "cSCC" = "#8da0cb")) +
+  labs(title = "TWIST1 vs OVOL1 Correlation Across Stages",
+       subtitle = "Spearman Correlation (Outlier-Removed & Batch-Corrected)") +
+  theme(strip.background = element_rect(fill = "gray90"), legend.position = "none")
+```
+CORRELATION HEAT MAP
+```{r}
+library(pheatmap)
+library(RColorBrewer)
+
+# ----------------------------------------------------------------
+# STEP 6: INTEGRATED CORRELATION HEATMAP (CLEAN VERSION)
+# ----------------------------------------------------------------
+
+# 1. Calculate the Correlation Matrix using the final cleaned data
+# Spearman is used to handle non-linear relationships and remains robust after ComBat
+cor_mat <- cor(t(final_exprs), method = "spearman")
+
+# 2. Define a high-contrast color palette (Navy for Negative, Firebrick for Positive)
+heatmap_colors <- colorRampPalette(c("#053061", "#f7f7f7", "#67001f"))(100)
+
+# 3. Generate the Heatmap
+# Clustering is set to 'correlation' to group genes that behave similarly
+pheatmap(cor_mat, 
+         main = "Meta-Analysis: Gene Correlation Matrix",
+         color = heatmap_colors,
+         display_numbers = TRUE,        # Shows Rho values (-1 to 1)
+         number_color = "black",
+         fontsize_number = 10,
+         clustering_distance_rows = "correlation", 
+         clustering_distance_cols = "correlation",
+         clustering_method = "complete",
+         treeheight_row = 40,           # Visualizes the 'closeness' of genes
+         treeheight_col = 40,
+         border_color = "white")
+```
+CORRELATION HEAT MAP BY STAGE
+```{r}
+library(pheatmap)
+library(dplyr)
+
+# 1. Define the specific markers for this analysis
+diff_markers <- c("KLF4", "IVL", "LOR", "KRT1", "KRT10")
+all_targets <- c("TWIST1", "OVOL1", diff_markers)
+
+# Ensure all markers are present in your common_genes
+available_targets <- intersect(all_targets, rownames(final_exprs))
+
+# 2. Create a function to generate the heatmap for a specific condition
+plot_condition_cor <- function(condition_name, data, meta, genes) {
+  
+  # Subset samples for the specific condition
+  samples <- rownames(meta[meta$Condition == condition_name, ])
+  cond_data <- data[genes, samples]
+  
+  # Calculate Pearson Correlation
+  cor_mat <- cor(t(cond_data), method = "pearson")
+  
+  # Generate Heatmap
+  pheatmap(cor_mat, 
+           main = paste("Pearson Correlation:", condition_name, "Stage"),
+           color = colorRampPalette(c("#053061", "#f7f7f7", "#67001f"))(100),
+           display_numbers = TRUE,
+           number_color = "black",
+           fontsize_number = 10,
+           clustering_distance_rows = "correlation",
+           clustering_distance_cols = "correlation",
+           border_color = "white")
+}
+
+# 3. Generate the heatmaps for AK and cSCC
+# (Note: These will appear as separate plots in your R environment)
+plot_condition_cor("AK", final_exprs, final_meta, available_targets)
+plot_condition_cor("cSCC", final_exprs, final_meta, available_targets)
+```
+

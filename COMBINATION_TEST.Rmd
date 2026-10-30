@@ -1,0 +1,121 @@
+---
+title: "COMBINATION_TEST"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+**TEST FOR COMBINATIONS OF DATA**
+```{r}
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(sva)
+library(tidyr)
+
+# 1. Define your Master List
+gse_ids <- c("GSE32628", "GSE45164", "GSE45216", "GSE98767")
+target_genes <- c("TWIST1", "OVOL1")
+
+# ----------------------------------------------------------------
+# STEP 1: PRE-DOWNLOAD & PRE-PROCESS INDIVIDUALS
+# ----------------------------------------------------------------
+# Store processed data in a list to avoid re-downloading in loops
+processed_data <- lapply(gse_ids, function(id) {
+  message("Pre-processing: ", id)
+  gse <- getGEO(id, destdir = ".", getGPL = TRUE)[[1]]
+  exprs_mat <- exprs(gse)
+  meta <- pData(gse)
+  
+  if (max(exprs_mat, na.rm=T) > 50) exprs_mat <- log2(exprs_mat + 1)
+  
+  # Standardize Metadata
+  meta <- meta %>%
+    mutate(Condition = case_when(
+      grepl("normal|control", paste(title, source_name_ch1), ignore.case = TRUE) ~ "NS",
+      grepl("keratosis|AK", paste(title, source_name_ch1), ignore.case = TRUE) ~ "AK",
+      grepl("carcinoma|SCC", paste(title, source_name_ch1), ignore.case = TRUE) ~ "cSCC",
+      TRUE ~ "Other"
+    )) %>%
+    filter(Condition != "Other") %>%
+    mutate(Batch = id, SampleID = rownames(.))
+  
+  # Map Genes
+  fdata <- fData(gse)
+  sym_col <- grep("SYMBOL|Gene.Symbol", colnames(fdata), ignore.case = TRUE, value = TRUE)[1]
+  mapping <- fdata %>% select(ID, Symbol = !!sym_col) %>% 
+    mutate(Symbol = gsub(" ///.*", "", Symbol)) %>% filter(Symbol %in% target_genes)
+  
+  sub_ex <- exprs_mat[as.character(mapping$ID), colnames(exprs_mat) %in% rownames(meta), drop=FALSE]
+  rownames(sub_ex) <- mapping$Symbol
+  return(list(exprs = avereps(sub_ex), meta = meta))
+})
+names(processed_data) <- gse_ids
+
+# ----------------------------------------------------------------
+# STEP 2: ROBUST COMBINATORIAL LOOP
+# ----------------------------------------------------------------
+results_list <- list()
+
+for (i in 1:length(gse_ids)) {
+  combos <- combn(gse_ids, i, simplify = FALSE)
+  
+  for (subset_ids in combos) {
+    combo_name <- paste(subset_ids, collapse = " + ")
+    message("Testing Combination: ", combo_name)
+    
+    current_list <- processed_data[subset_ids]
+    common_genes <- Reduce(intersect, lapply(current_list, function(x) rownames(x$exprs)))
+    
+    if(!all(c("TWIST1", "OVOL1") %in% common_genes)) next
+    
+    merged_exprs <- do.call(cbind, lapply(current_list, function(x) x$exprs[common_genes, ]))
+    merged_meta <- do.call(rbind, lapply(current_list, function(x) x$meta %>% select(Condition, Batch)))
+    
+    # --- BATCH CORRECTION WITH SINGULARITY CHECK ---
+    final_exprs <- merged_exprs
+    if (length(subset_ids) > 1) {
+      merged_meta$Condition <- as.factor(merged_meta$Condition)
+      merged_meta$Batch <- as.factor(merged_meta$Batch)
+      
+      # Check if 'Condition' has more than 1 level and isn't confounded with 'Batch'
+      # If a condition only exists in one batch, we can't use it in the model
+      condition_counts <- table(merged_meta$Condition, merged_meta$Batch)
+      is_singular <- any(rowSums(condition_counts > 0) < 2) 
+      
+      tryCatch({
+        if (is_singular) {
+          message("  ! Confounding detected. Running ComBat without Condition adjustment.")
+          # Use an intercept-only model if groups don't overlap across batches
+          mod_null <- model.matrix(~1, data = merged_meta)
+          final_exprs <- ComBat(dat = merged_exprs, batch = merged_meta$Batch, mod = mod_null)
+        } else {
+          mod <- model.matrix(~Condition, data = merged_meta)
+          final_exprs <- ComBat(dat = merged_exprs, batch = merged_meta$Batch, mod = mod)
+        }
+      }, error = function(e) {
+        message("  ! ComBat failed for ", combo_name, ". Using uncorrected data.")
+        final_exprs <<- merged_exprs
+      })
+    }
+    
+    # --- STATISTICS ---
+    cor_res <- tryCatch({
+      ct <- cor.test(final_exprs["TWIST1",], final_exprs["OVOL1",], method = "pearson")
+      list(r = ct$estimate, p = ct$p.value)
+    }, error = function(e) list(r = NA, p = NA))
+    
+    results_list[[combo_name]] <- data.frame(
+      Combination = combo_name,
+      Num_Datasets = length(subset_ids),
+      Total_Samples = ncol(final_exprs),
+      Pearson_R = cor_res$r,
+      P_Value = cor_res$p,
+      Significant = ifelse(!is.na(cor_res$p) && cor_res$p < 0.05, "YES", "NO")
+    )
+  }
+}
+
+final_results_table <- do.call(rbind, results_list) %>% arrange(P_Value)
+print(final_results_table)
+```
