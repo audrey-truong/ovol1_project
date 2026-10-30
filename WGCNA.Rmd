@@ -1,0 +1,270 @@
+
+**WGCNA pipeline**
+
+
+
+
+```{r}
+## DATA PROCESSING
+
+# read in data
+counts_matrix <- read.csv("~/Desktop/OVOL1_proj/hit-counts/raw_counts.csv")
+
+#renaming sample to maintain consistencies
+counts_matrix <- counts_matrix %>% rename(
+  K5.rTA.1 = K5.1,
+  K5.rTA.2 = K5.2,
+  K5.rTA.3 = K5.3,
+  K5.OVOL1.1 = K5Ovol1.1,
+  K5.OVOL1.2 = K5Ovol1.2,
+  K5.OVOL1.3 = K5Ovol1.3,
+)
+
+datExpr <- readRDS("~/Desktop/OVOL1_proj/datExpr.rds")
+
+# change row names in for consistencies
+rownames(datExpr) <- c("K5.rtTA.3", "K5.rtTA.2", "K5.rtTA.1",
+                       "K5.OVOL1.3", "K5.OVOL1.2", "K5.OVOL1.1",
+                       "WT.3", "WT.2", "WT.1")
+```
+
+
+```{r}
+# ==============================================================================
+# Load Libraries & Set Options
+# ==============================================================================
+
+library(WGCNA)
+library(DESeq2)
+library(tidyverse)
+library(clusterProfiler)
+library(org.Mm.eg.db) # Mouse annotation library
+library(enrichplot)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(ggplot2)
+
+# WGCNA specific settings
+options(stringsAsFactors = FALSE)
+enableWGCNAThreads() # Enable multi-threading for faster execution
+
+```
+
+
+```{r}
+
+# ==============================================================================
+# Quality Control & Sample Outlier Detection
+# ==============================================================================
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+# Cluster samples to detect outliers
+sampleTree <- hclust(dist(datExpr), method = "average")
+plot(sampleTree, main = "Sample clustering to detect outliers", 
+     sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+```{r}
+# ==============================================================================
+# Select Soft-Thresholding Power 
+# ==============================================================================
+# For unsigned/signed networks with small sample size (n < 20), 
+# powers higher than default might be necessary to achieve scale-free topology.
+powers <- c(c(1:10), seq(from = 12, to = 20, by = 2))
+sft <- pickSoftThreshold(datExpr, powerVector = powers, verbose = 5, networkType = "signed")
+
+# Plot the scale-free topology fit index
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.80, col = "red") # Target R^2 threshold
+
+
+# Choose power: Pick the lowest power where R^2 reaches ~0.80 (or maximum plateau)
+softPower <- sft$powerEstimate 
+if(is.na(softPower)) softPower <- 12 # Fallback recommendation for signed networks n < 20
+```
+```{r}
+# ==============================================================================
+# Construct Co-expression Network & Identify Modules
+# ==============================================================================
+net <- blockwiseModules(
+  datExpr,
+  power = softPower,
+  networkType = "signed",           # "signed" or "signed hybrid" recommended for TF expression
+  TOMType = "signed",
+  minModuleSize = 30,               # Minimum size for gene modules
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,            # Merge modules with correlation >= 0.75
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = FALSE,
+  verbose = 3
+)
+
+# Convert numeric labels to color labels
+moduleColors <- labels2colors(net$colors)
+
+# Plot Dendrogram with Module Colors
+plotDendroAndColors(net$dendrograms[[1]], moduleColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Cluster Dendrogram and Module Colors")
+# save results
+
+saveRDS(net, file = "~/Desktop/OVOL1_proj/net_wgcna_output.rds")
+```
+
+
+```{r}
+# ==============================================================================
+# Identify the Ovol1 Module and Core Hub Genes
+# ==============================================================================
+# Locate Ovol1 module color
+# Note: Ensure gene name matches your matrix format (e.g., "Ovol1" or "OVOL1")
+target_gene <- "Ovol1" 
+
+if (target_gene %in% colnames(datExpr)) {
+  ovol1_module <- moduleColors[which(colnames(datExpr) == target_gene)]
+  cat("Ovol1 is located in module:", ovol1_module, "\n")
+  
+  # Extract all genes in the Ovol1 module
+  module_genes <- colnames(datExpr)[moduleColors == ovol1_module]
+  
+  # Calculate Module Membership (MM) / kME
+  # Calculates correlation between individual gene expression profiles and Module Eigengene (ME)
+  MEs <- net$MEs
+  colnames(MEs) <- paste0("ME", labels2colors(as.numeric(gsub("ME", "", colnames(MEs)))))
+  
+  geneModuleMembership <- as.data.frame(cor(datExpr, MEs, use = "p"))
+  MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nrow(datExpr)))
+  
+  # Extract MM for Ovol1 module
+  target_col <- paste0("ME", ovol1_module)
+  ovol1_module_df <- data.frame(
+    Gene = module_genes,
+    ModuleMembership = geneModuleMembership[module_genes, target_col],
+    Pvalue = MMPvalue[module_genes, target_col]
+  ) %>% 
+    arrange(desc(ModuleMembership))
+  
+  # Output top hub genes co-expressed with Ovol1
+  head(ovol1_module_df, 20)
+  
+} else {
+  warning("Ovol1 was not found in the filtered dataset. Consider relaxing initial variance filters.")
+}
+
+# ==============================================================================
+# Export Module Genes for Downstream Enrichment (ClusterProfiler)
+# ==============================================================================
+# Save genes in Ovol1 module to CSV
+write.csv(ovol1_module_df, file = "~/Desktop/OVOL1_proj/Ovol1_Coexpression_Module_Genes.csv", row.names = FALSE)
+```
+
+
+Pathway enrichment - ClusterProfiler
+```{r}
+# Filter for core hub genes (e.g., top Module Membership / kME > 0.7 or top 100-200 genes)
+hub_genes <- ovol1_module_df %>%
+  filter(ModuleMembership >= 0.95 & Pvalue < 0.005) %>% 
+  pull(Gene)
+
+cat("Number of hub genes for enrichment:", length(hub_genes), "\n")
+
+# Convert gene symbols to Entrez IDs
+gene_ids <- bitr(
+  hub_genes, 
+  fromType = "SYMBOL", 
+  toType   = "ENTREZID", 
+  OrgDb    = org.Mm.eg.db
+)
+
+# Vector of Entrez IDs
+entrez_vec <- gene_ids$ENTREZID
+
+# Run GO Enrichment for Biological Processes (BP)
+ego_bp <- enrichGO(
+  gene          = entrez_vec,
+  OrgDb         = org.Mm.eg.db,
+  ont           = "BP",                # "BP" for Biological Process
+  pAdjustMethod = "BH",                # Benjamini-Hochberg adjustment
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.10,
+  readable      = TRUE                 # Converts Entrez IDs back to Gene Symbols in results
+)
+
+# View top enriched terms
+head(ego_bp)
+
+# Save GO results to CSV
+write.csv(as.data.frame(ego_bp), "Ovol1_Module_GO_BP_Enrichment.csv", row.names = FALSE)
+
+
+# Run KEGG Enrichment (mmu = Mus musculus)
+kegg_res <- enrichKEGG(
+  gene         = entrez_vec,
+  organism     = "mmu",
+  pvalueCutoff = 0.05
+)
+
+# Convert Entrez IDs back to symbols in the KEGG object for readability
+kegg_res <- setReadable(kegg_res, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+
+# View top KEGG pathways
+head(kegg_res)
+
+# Save KEGG results to CSV
+write.csv(as.data.frame(kegg_res), "Ovol1_Module_KEGG_Enrichment.csv", row.names = FALSE)
+```
+
+Enrichment visualization
+```{r}
+#______DOT PLOT________
+p_dot <- dotplot(ego_bp, showCategory = 15, title = "GO Biological Processes - Ovol1 Module Hubs")
+
+ggsave(
+  filename = "~/Desktop/OVOL1_proj/OVOL1_module_GO_dotplot.png", 
+  plot = p_dot, 
+  width = 10,       # Increase width to give labels more room
+  height = 8, 
+  dpi = 300
+)
+
+
+p_dot <- dotplot(kegg_res, showCategory = 15, title = "KEGG - Ovol1 Module Hubs")
+
+ggsave(
+  filename = "~/Desktop/OVOL1_proj/OVOL1_module_KEGG_dotplot.png", 
+  plot = p_dot, 
+  width = 10,       # Increase width to give labels more room
+  height = 8, 
+  dpi = 300
+)
+
+#______NET PLOT_____
+p_net <- cnetplot(
+  ego_bp, 
+  showCategory = 4,
+  layout = "kk",               # For circular layout, use igraph::layout_in_circle or layout = "circle"
+  color_edge = "category"     # Replaces colorEdge = TRUE (options: 'category', 'none', 'black')
+)
+
+
+p_net <- cnetplot(
+  kegg_res, 
+  showCategory = 4,
+  layout = "kk",               # For circular layout, use igraph::layout_in_circle or layout = "circle"
+  color_edge = "category"     # Replaces colorEdge = TRUE (options: 'category', 'none', 'black')
+)
+
+print(p_net)
+```
+
